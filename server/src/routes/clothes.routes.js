@@ -5,6 +5,17 @@ const axios = require("axios");
 const ClothingItem = require("../models/ClothingItem");
 const upload = require("../middleware/upload");
 
+/**
+ * IMPORTANT:
+ * Multer/Cloudinary errors can happen BEFORE your route handler runs.
+ * This error middleware will return JSON instead of an unhelpful 500.
+ */
+function uploadErrorHandler(err, _req, res, next) {
+  if (!err) return next();
+  console.error("Multer/Upload error:", err);
+  return res.status(400).json({ error: err.message || "Upload error" });
+}
+
 router.get("/", authRequired, async (req, res) => {
   try {
     const items = await ClothingItem.find({ userId: req.user.id });
@@ -15,38 +26,101 @@ router.get("/", authRequired, async (req, res) => {
   }
 });
 
-router.post("/upload", authRequired, upload.single("image"), async (req, res) => {
-  try {
-    const imageUrl = req.file.path;
+router.post(
+  "/upload",
+  authRequired,
+  upload.single("image"),
+  uploadErrorHandler,
+  async (req, res) => {
+    try {
+      if (!req.file?.path) {
+        return res.status(400).json({ error: "Image upload failed (no file received)" });
+      }
 
-    const visionResponse = await axios.post("http://127.0.0.1:8000/analyze", {
-      image_url: imageUrl,
-    });
+      const imageUrl = req.file.path;
 
-    const aiData = visionResponse.data;
+      console.log("UPLOAD: file received", {
+        originalname: req.file?.originalname,
+        mimetype: req.file?.mimetype,
+        size: req.file?.size,
+        path: req.file?.path,
+      });
 
-    const sub = aiData?.category?.sub;
-    if (["jacket", "coat"].includes(sub)) {
-      aiData.category.main = "outerwear";
+      // Call Vision AI safely (do not fail upload if AI is down)
+      let aiData;
+      try {
+        const visionResponse = await axios.post("http://127.0.0.1:8000/analyze", {
+          image_url: imageUrl, // ai-service expects this
+          imageUrl,            // keep for compatibility
+        });
+        aiData = visionResponse.data;
+      } catch (e) {
+        console.error("Vision service failed:", e?.message);
+        console.error("Vision service status:", e?.response?.status);
+        console.error("Vision service data:", e?.response?.data);
+
+        aiData = {
+          category: { main: "top", sub: "other" },
+          color: ["unknown"],
+          style: [],
+          season: [],
+          embedding: [],
+        };
+      }
+
+      // Normalize aiData -> schema-safe values
+      const allowedMains = ["top", "bottom", "footwear", "outerwear", "accessory"];
+
+      const sub =
+        typeof aiData?.category?.sub === "string" && aiData.category.sub.trim()
+          ? aiData.category.sub.trim().toLowerCase()
+          : "other";
+
+      let main = allowedMains.includes(aiData?.category?.main) ? aiData.category.main : "top";
+
+      // map outerwear subs
+      if (["jacket", "coat"].includes(sub)) {
+        main = "outerwear";
+      }
+
+      const color =
+        Array.isArray(aiData?.color) && aiData.color.length
+          ? aiData.color.map((c) => String(c).toLowerCase())
+          : ["unknown"];
+
+      const style = Array.isArray(aiData?.style) ? aiData.style.map(String) : [];
+      const season = Array.isArray(aiData?.season) ? aiData.season.map(String) : [];
+
+      const embedding = Array.isArray(aiData?.embedding)
+        ? aiData.embedding.map((n) => Number(n)).filter((n) => Number.isFinite(n))
+        : [];
+
+      const clothing = new ClothingItem({
+        userId: req.user.id,
+        imageUrl,
+        category: { main, sub },
+        color,
+        style,
+        season,
+        embedding,
+      });
+
+      await clothing.save();
+      return res.json(clothing);
+    } catch (error) {
+      console.error("Upload error message:", error?.message);
+      console.error("Upload error name:", error?.name);
+      console.error("Upload error stack:", error?.stack);
+
+      if (error?.name === "ValidationError") {
+        console.error("ValidationError details:", error?.errors);
+        return res.status(400).json({ error: error.message, details: error.errors });
+      }
+
+      return res.status(500).json({ error: error?.message || "Upload failed" });
     }
-
-    const clothing = new ClothingItem({
-      userId: req.user.id,
-      imageUrl,
-      category: aiData.category,
-      color: aiData.color,
-      style: aiData.style,
-      season: aiData.season,
-      embedding: aiData.embedding,
-    });
-
-    await clothing.save();
-    res.json(clothing);
-  } catch (error) {
-    console.error("Upload error:", error);
-    res.status(500).json({ error: error.message });
   }
-});
+);
 
 router.patch("/:id", authRequired, async (req, res) => {
   try {
@@ -78,7 +152,7 @@ router.delete("/:id", authRequired, async (req, res) => {
   try {
     const item = await ClothingItem.findOne({
       _id: req.params.id,
-      userId: req.user.id
+      userId: req.user.id,
     });
 
     if (!item) {
@@ -86,11 +160,10 @@ router.delete("/:id", authRequired, async (req, res) => {
     }
 
     await ClothingItem.deleteOne({ _id: req.params.id });
-    
-    res.json({ message: "Item deleted successfully", id: req.params.id });
+    return res.json({ message: "Item deleted successfully", id: req.params.id });
   } catch (error) {
     console.error("Delete error:", error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message || "Delete failed" });
   }
 });
 
